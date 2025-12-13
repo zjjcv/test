@@ -129,6 +129,28 @@ def calc_l2_norm(model):
         total_norm += param_norm.item() ** 2
     return total_norm ** 0.5
 
+def calc_spectral_entropy(model):
+    """计算模型权重矩阵的谱熵"""
+    total_entropy = 0.0
+    num_matrices = 0
+    
+    for name, param in model.named_parameters():
+        if len(param.shape) >= 2:  # 只对矩阵计算谱熵
+            try:
+                # 计算奇异值
+                with torch.no_grad():
+                    s = torch.linalg.svdvals(param.data.float())
+                    # 归一化为概率分布
+                    s_normalized = s / (s.sum() + 1e-10)
+                    # 计算熵
+                    entropy = -(s_normalized * torch.log(s_normalized + 1e-10)).sum().item()
+                    total_entropy += entropy
+                    num_matrices += 1
+            except Exception:
+                continue
+    
+    return total_entropy / max(num_matrices, 1)
+
 # =============================================================================
 # 3. 数据生成 (保持不变)
 # =============================================================================
@@ -183,7 +205,15 @@ def run_atomic_experiment(config):
     scaler = torch.amp.GradScaler('cuda')  # 修复 FutureWarning
     llc_estimator = LLCEstimator(model, F.cross_entropy, llc_loader, device)
 
-    metrics = {'steps': [], 'train_loss': [], 'train_acc': [], 'test_loss': [], 'test_acc': [], 'llc': [], 'l2_norm': []}
+    # 创建保存目录 - 固定在/root/autodl-tmp/test/results下
+    task_safe = task_name.replace("/", "_div_").replace("*", "_mul_").replace("+", "_plus_")
+    results_base = "/root/autodl-tmp/test/results"
+    data_dir = os.path.join(results_base, "data", task_safe, f"wd_{wd}")
+    checkpoint_dir = os.path.join(results_base, "checkpoints", task_safe, f"wd_{wd}")
+    os.makedirs(data_dir, exist_ok=True)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    metrics = {'steps': [], 'train_loss': [], 'train_acc': [], 'test_loss': [], 'test_acc': [], 'llc': [], 'l2_norm': [], 'spectral_entropy': []}
     steps = 0
     
     # [Log] 开始
@@ -221,14 +251,13 @@ def run_atomic_experiment(config):
                         test_acc = (t_logits[:, -1, :].argmax(-1) == t_target).float().mean().item()
                 
                 # LLC
-                llc_val = np.nan
-                if steps % 100 == 0 or steps == args.budget:
-                    llc_val = llc_estimator.estimate(model.state_dict(), num_draws=20, lr=1e-4)
-                elif len(metrics['llc']) > 0:
-                    llc_val = metrics['llc'][-1]
+                llc_val = llc_estimator.estimate(model.state_dict(), num_draws=20, lr=1e-4)
 
                 # L2 Norm
                 l2_val = calc_l2_norm(model)
+                
+                # Spectral Entropy
+                spectral_entropy_val = calc_spectral_entropy(model)
 
                 metrics['steps'].append(steps)
                 metrics['train_loss'].append(loss_val)
@@ -237,6 +266,33 @@ def run_atomic_experiment(config):
                 metrics['test_acc'].append(test_acc)
                 metrics['llc'].append(llc_val)
                 metrics['l2_norm'].append(l2_val)
+                metrics['spectral_entropy'].append(spectral_entropy_val)
+                
+                # 保存数据到 results/data
+                step_data = {
+                    'step': steps,
+                    'train_loss': loss_val,
+                    'train_acc': acc,
+                    'test_loss': test_loss,
+                    'test_acc': test_acc,
+                    'llc': llc_val,
+                    'l2_norm': l2_val,
+                    'spectral_entropy': spectral_entropy_val
+                }
+                step_csv = os.path.join(data_dir, f"seed{seed}_step{steps}.csv")
+                with open(step_csv, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=step_data.keys())
+                    writer.writeheader()
+                    writer.writerow(step_data)
+                
+                # 保存模型权重到 results/checkpoints
+                checkpoint_path = os.path.join(checkpoint_dir, f"seed{seed}_step{steps}.pt")
+                torch.save({
+                    'step': steps,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'metrics': step_data
+                }, checkpoint_path)
 
             if steps >= args.budget:
                 break
@@ -270,12 +326,14 @@ def plot_multiseed_results(results_list, task_name, wd, save_dir):
     tr_loss_m, tr_loss_s = get_stats('train_loss')
     te_loss_m, te_loss_s = get_stats('test_loss')
     l2_m, l2_s = get_stats('l2_norm')
+    se_m, se_s = get_stats('spectral_entropy')
     
     llc_raw = np.array([r['llc'] for r in results_list])
     llc_m = np.nanmean(llc_raw, axis=0)
     llc_s = np.nanstd(llc_raw, axis=0)
 
-    fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(26, 5))
+    fig, axes = plt.subplots(1, 5, figsize=(32, 5))
+    ax1, ax2, ax3, ax4, ax5 = axes
     
     # Acc
     ax1.plot(steps, tr_acc_m, color='blue', label='Train')
@@ -323,6 +381,16 @@ def plot_multiseed_results(results_list, task_name, wd, save_dir):
     ax4.legend()
     ax4.grid(True, alpha=0.3)
 
+    # Spectral Entropy
+    ax5.plot(steps, se_m, color='orange', label='Spectral Entropy')
+    ax5.fill_between(steps, se_m-se_s, se_m+se_s, color='orange', alpha=0.2)
+    ax5.set_title('Spectral Entropy')
+    ax5.set_xlabel('Steps')
+    ax5.set_ylabel('Entropy')
+    ax5.set_xscale('log')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+
     plt.suptitle(rf"Task: {task_name} | WD: {wd} | (Mean $\pm$ Std over 3 seeds)")
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"{task_name.replace('/','_')}_wd{wd}.png"), dpi=150)
@@ -338,8 +406,7 @@ def main():
     parser.add_argument("--budget", type=int, default=100000) 
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
-    # 54个并发进程 - 平衡GPU利用率和稳定性
-    # 如果遇到 CUDA out of memory，请手动改小这个数字 (例如 32)
+    # 54个并发进程 - 一次性全部运行
     parser.add_argument("--max_workers", type=int, default=54, help="Max parallel processes")
     args = parser.parse_args()
 
@@ -372,8 +439,8 @@ def main():
     print(f"Max workers: {args.max_workers}")
     print(f"Batch size: {args.batch_size}")
     print(f"Output dir: {base_dir}")
-    print("Starting parallel training...")
-
+    print("Starting parallel training (all 54 tasks)...")
+    
     results_cache = {} 
     
     try:
@@ -381,7 +448,7 @@ def main():
     except RuntimeError:
         pass
 
-    # 使用 ProcessPoolExecutor 拉满并发
+    # 使用 ProcessPoolExecutor 一次性运行所有54个任务
     with ProcessPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(run_atomic_experiment, cfg) for cfg in task_queue]
         
