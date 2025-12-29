@@ -1,0 +1,59 @@
+Method,Task,T_grok,Acc
+AdamW + L2,IMDB,,50.1
+CPR,IMDB,,50.9
+Spectral Decoup.,IMDB,,50.2
+AdamW (Base),IMDB,,51.6
+IRE,SpeechCmd,,11.1
+Label Smoothing,SpeechCmd,,10.2
+Dropout,SpeechCmd,,8.9
+Spectral Ent.,SpeechCmd,,8.3
+AdamW + L2,Mod Sub,21800.0,97.72582359192349
+IRE,Mod Sub,,0.8501594048884166
+CQN-SGLD,IMDB,,49.0
+SAMpa,SpeechCmd,,10.7
+AdamW + L2,SpeechCmd,,11.7
+AdamW (Base),SpeechCmd,,10.9
+Label Smoothing,Mod Sub,,0.722635494155154
+Spectral Ent.,IMDB,,49.9
+Logit Norm,Mod Sub,,1.9341126461211477
+Dropout,Mod Sub,7800.0,100.0
+Dropout,IMDB,,49.7
+CPR,SpeechCmd,,11.6
+UnifiedSAM,Mod Sub,,0.5526036131774708
+CQN-SGLD,SpeechCmd,,11.3
+SAMpa,Mod Sub,,0.6163655685441021
+UnifiedSAM,SpeechCmd,,9.9
+CPR,Mod Sub,,0.17003188097768332
+ASAM,SpeechCmd,,11.0
+Spectral Ent.,Mod Sub,,9.713071200850159
+AdamW (Base),Mod Sub,,0.5526036131774708
+Label Smoothing,IMDB,,52.6
+Spectral Decoup.,SpeechCmd,,11.5
+SAM,Mod Sub,,0.5313496280552603
+SAM,SpeechCmd,,9.6
+Logit Norm,SpeechCmd,,10.4
+IRE,IMDB,,50.4
+CQN-SGLD,Mod Sub,,1.083953241232731
+Spectral Ent.,MNIST,,87.31
+Logit Norm,IMDB,,47.0
+CQN-SGLD,MNIST,,9.8
+ASAM,Mod Sub,,5.759829968119022
+UnifiedSAM,MNIST,,86.91
+Spectral Decoup.,Mod Sub,,1.2114771519659937
+SAM,MNIST,,87.01
+AdamW (Base),MNIST,,87.39
+SAMpa,MNIST,,87.91
+Spectral Decoup.,MNIST,,87.21
+ASAM,MNIST,,86.7
+IRE,MNIST,,86.59
+Logit Norm,MNIST,,75.34
+Relative Flatness,MNIST,,76.28
+Dropout,MNIST,,91.63
+AdamW + L2,MNIST,,88.32
+CPR,MNIST,,86.78
+Label Smoothing,MNIST,,67.23
+Relative Flatness,SpeechCmd,,8.4
+SAM,IMDB,,48.5
+UnifiedSAM,IMDB,,46.3
+ASAM,IMDB,,51.9
+SAMpa,IMDB,,52.4

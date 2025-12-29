@@ -3,7 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import math
 from tqdm import tqdm
@@ -14,14 +13,15 @@ from tqdm import tqdm
 PROJECT_ROOT = "/data/zjj/test" 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 指向 WD=1.0, Step 100,000 的权重
-CKPT_PATH = os.path.join(PROJECT_ROOT, 'results', 'checkpoints', 'x-y', 'wd_1.0', 'seed42_step1000.pt')
+# Updated Path for GPT2-Large x_plus_y task
+# Assuming we want to analyze the final converged model (e.g., step 100,000 with WD=1.0)
+CKPT_PATH = os.path.join(PROJECT_ROOT, 'results', 'gpt2-large', 'checkpoints', 'x_plus_y', 'wd_0.0', 'seed42_step100000.pt')
 PLOT_DIR = os.path.join(PROJECT_ROOT, 'results', 'analysis_plots')
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 P = 97 
 
-# 绘图风格
+# Plotting Style
 plt.style.use('seaborn-v0_8-paper')
 plt.rcParams.update({
     'font.family': 'sans-serif',
@@ -33,7 +33,7 @@ plt.rcParams.update({
 })
 
 # =========================================================================
-# 1. Native Model Architecture (直接复用您的训练代码)
+# 1. Model Architecture (Custom GPT2-Large)
 # =========================================================================
 
 class CausalSelfAttention(nn.Module):
@@ -94,7 +94,8 @@ class GPT2Block(nn.Module):
         return x
 
 class GPT2Decoder(nn.Module):
-    def __init__(self, dim=1024, num_layers=24, num_heads=16, num_tokens=99, seq_len=5, dropout=0.0, use_checkpoint=True):
+    # GPT-2 Large Config: dim=1280, layers=36, heads=20
+    def __init__(self, dim=1280, num_layers=36, num_heads=20, num_tokens=99, seq_len=5, dropout=0.0, use_checkpoint=True):
         super().__init__()
         self.token_embeddings = nn.Embedding(num_tokens, dim)
         self.position_embeddings = nn.Embedding(seq_len, dim)
@@ -107,7 +108,6 @@ class GPT2Decoder(nn.Module):
         self.register_buffer("causal_mask", mask)
         self.register_buffer("pos_ids", torch.arange(seq_len))
         
-        # 保存配置以便调用
         self.config = type('Config', (), {'n_layer': num_layers, 'n_head': num_heads, 'n_embd': dim})()
 
     def forward(self, x):
@@ -133,34 +133,31 @@ def load_native_model():
         
     ckpt = torch.load(CKPT_PATH, map_location=DEVICE)
     
-    # 实例化原生模型 (参数与训练代码默认值一致)
+    # Init Model (GPT2-Large Config)
     model = GPT2Decoder(
-        dim=1024, num_layers=24, num_heads=16,
-        num_tokens=P + 2, # 97 + 2 = 99
+        dim=1280, num_layers=36, num_heads=20,
+        num_tokens=P + 2, 
         seq_len=5, dropout=0.0, use_checkpoint=False
     )
     
-    # 直接加载权重，无需转换
     state_dict = ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt
     
-    # 处理可能的 DataParallel前缀
     new_sd = {}
     for k, v in state_dict.items():
         if k.startswith('module.'): new_sd[k[7:]] = v
         else: new_sd[k] = v
         
-    keys = model.load_state_dict(new_sd, strict=True) # 开启严格模式
+    keys = model.load_state_dict(new_sd, strict=True)
     print(f"   Load Status: {keys}")
     
     model.to(DEVICE)
     model.eval()
     return model
 
-def generate_batch(batch_size=1024):
-    """ 生成 (x - y) mod P 的数据 """
-    # 修正：训练代码中 y = torch.arange(1, p)，所以 y 不能为 0
+def generate_batch_x_plus_y(batch_size=1024):
+    """ 生成 (x + y) mod P 的数据 """
     a = torch.randint(0, P, (batch_size,))
-    b = torch.randint(1, P, (batch_size,)) # 从 1 开始
+    b = torch.randint(1, P, (batch_size,)) 
     
     input_ids = torch.stack([
         a,
@@ -169,13 +166,13 @@ def generate_batch(batch_size=1024):
         torch.full_like(a, P+1)     # eq token
     ], dim=1).to(DEVICE)
     
-    targets = (a - b) % P
+    targets = (a + b) % P # Corrected for x_plus_y
     targets = targets.to(DEVICE)
     return input_ids, targets
 
 def get_accuracy(model, inputs, targets):
     with torch.no_grad():
-        logits = model(inputs) # output logits directly
+        logits = model(inputs) 
         preds = logits[:, -1, :].argmax(dim=-1)
         acc = (preds == targets).float().mean().item()
     return acc
@@ -195,28 +192,17 @@ class HeadAblator:
         self._register_hooks()
         
     def _register_hooks(self):
-        # Hook into Native Model Structure: model.blocks[i].attn.c_proj
         for i in range(self.n_layer):
             layer = self.model.blocks[i]
             def get_hook(layer_idx):
                 def hook_fn(module, args):
-                    # args[0] is the input to c_proj, which is `y` (concat of heads)
-                    # shape: [batch, seq, hidden]
                     x = args[0]
                     B, T, C = x.shape
-                    
-                    # Reshape to separate heads: [B, T, n_head, head_dim]
                     x = x.view(B, T, self.n_head, self.head_dim)
-                    
-                    # Broadcast mask: [1, 1, n_head, 1]
                     mask = self.mask[layer_idx].view(1, 1, self.n_head, 1)
                     x = x * mask
-                    
-                    # Flatten back
                     return x.view(B, T, C)
                 return hook_fn
-            
-            # Register PRE-hook on c_proj
             self.hooks.append(layer.attn.c_proj.register_forward_pre_hook(get_hook(i)))
 
     def reset(self):
@@ -235,23 +221,20 @@ class HeadAblator:
 
 def calculate_importance(model):
     print("Running CMA scan...")
-    ablator = HeadAblator(model) # Just to be safe with hooks structure, though we patch manually
-    ablator.close() # Remove ablator hooks for CMA
+    ablator = HeadAblator(model) 
+    ablator.close() 
     
-    # Data
     batch_size = 64
     a = torch.randint(0, P, (batch_size,))
     b1 = torch.randint(1, P, (batch_size,))
     b2 = (b1 + 1) % P 
-    # Ensure b2 != 0 if needed, usually (b1+1)%P is safe enough or mapped
     b2[b2==0] = 1 
     
     c1_ids = torch.stack([a, torch.full_like(a, P), b1, torch.full_like(a, P+1)], dim=1).to(DEVICE)
     c2_ids = torch.stack([a, torch.full_like(a, P), b2, torch.full_like(a, P+1)], dim=1).to(DEVICE)
-    targets = (a - b1) % P
+    targets = (a + b1) % P # x_plus_y
     targets = targets.to(DEVICE)
     
-    # 1. Cache Corrupted Acts
     source_acts = {}
     temp_hooks = []
     for i in range(model.config.n_layer):
@@ -262,10 +245,8 @@ def calculate_importance(model):
     with torch.no_grad(): model(c2_ids)
     for h in temp_hooks: h.remove()
     
-    # 2. Base Score
     base_acc = get_accuracy(model, c1_ids, targets)
     
-    # 3. Patch Scan
     importances = []
     n_head = model.config.n_head
     head_dim = model.config.n_embd // n_head
@@ -287,12 +268,9 @@ def calculate_importance(model):
                 logits = model(c1_ids)
             handle.remove()
             
-            # Use Logit diff or Prob diff? 
-            # Paper usually uses Prob(Correct) drop
             probs = torch.softmax(logits[:, -1, :], dim=-1)
             patched_score = probs.gather(1, targets.unsqueeze(1)).mean().item()
             
-            # Impact = Base - Patched
             importances.append( ((l, h), base_acc - patched_score) )
             
     return sorted(importances, key=lambda x: x[1], reverse=True)
@@ -306,17 +284,18 @@ def run_curve(model, ablator, inputs, targets, head_order):
     accs = [get_accuracy(model, inputs, targets)]
     steps = [0]
     
-    # Optimization: Chunked ablation
     chunk_size = 1
     total_heads = len(head_order)
+    
+    # Adaptive chunking for speed
+    if total_heads > 200: chunk_size = 5
     
     for i in range(0, total_heads, chunk_size):
         batch = head_order[i : i+chunk_size]
         ablator.ablate(batch)
         
-        # 为了让曲线更平滑，每消融一点就测一次，或者跳跃测
-        # 关键区域（前10个）每步测，后面跳跃
-        if i < 20 or i % 5 == 0:
+        # Measure more frequently at start
+        if i < 50 or i % (chunk_size * 5) == 0:
             acc = get_accuracy(model, inputs, targets)
             accs.append(acc)
             steps.append(i + len(batch))
@@ -324,38 +303,32 @@ def run_curve(model, ablator, inputs, targets, head_order):
     return steps, accs
 
 def main():
-    print("🚀 Starting Native Ablation Analysis (Grouped Layers, No Control)...")
+    print("🚀 Starting GPT2-Large Ablation Analysis (36 Layers, 20 Heads)...")
     model = load_native_model()
     
-    # Sanity Check
-    inputs, targets = generate_batch(1024)
+    inputs, targets = generate_batch_x_plus_y(1024)
     base_acc = get_accuracy(model, inputs, targets)
     print(f"   Base Accuracy: {base_acc:.4f}")
     if base_acc < 0.9:
-        print("❌ Warning: Accuracy < 90%. Check input format or checkpoint.")
-        # return # 可选择是否继续
+        print("❌ Warning: Accuracy < 90%.")
 
-    # 1. CMA Importance
     sorted_heads = calculate_importance(model)
-    
-    # 2. Setup
     ablator = HeadAblator(model)
-    
     all_heads = [h[0] for h in sorted_heads]
     
-    # --- 定义层级组范围 ---
-    l0_7_heads   = [h for h in all_heads if 0 <= h[0] <= 7]
-    l8_15_heads  = [h for h in all_heads if 8 <= h[0] <= 15]
-    l16_23_heads = [h for h in all_heads if 16 <= h[0] <= 23]
+    # --- Split into 12-layer chunks ---
+    # Shallow: 0-11, Middle: 12-23, Deep: 24-35
+    l0_11_heads  = [h for h in all_heads if 0 <= h[0] <= 11]
+    l12_23_heads = [h for h in all_heads if 12 <= h[0] <= 23]
+    l24_35_heads = [h for h in all_heads if 24 <= h[0] <= 35]
     
     experiments = [
         ("Global (All Layers)", all_heads),
-        ("Layers 0-7 (Shallow)", l0_7_heads),
-        ("Layers 8-15 (Middle)", l8_15_heads),
-        ("Layers 16-23 (Deep)", l16_23_heads)
+        ("Layers 0-11 (Shallow)", l0_11_heads),
+        ("Layers 12-23 (Middle)", l12_23_heads),
+        ("Layers 24-35 (Deep)", l24_35_heads)
     ]
     
-    # 3. Plotting
     fig, axes = plt.subplots(1, 4, figsize=(22, 5.5), dpi=150, sharey=True)
     plt.subplots_adjust(wspace=0.1)
     
@@ -364,19 +337,19 @@ def main():
         ax = axes[idx]
         scope_set = set(scope_heads)
         
-        # Order for Ablation (High CMA -> Low CMA)
+        # Order: High CMA -> Low CMA
         red_order = [h for h, s in sorted_heads if h in scope_set]
         
         # --- Run Random (Blue) ---
         rand_res = []
         rand_x = []
-        for _ in range(5):
+        for _ in range(3): # Reduce iterations for speed on large model
             np.random.shuffle(scope_heads)
             rx, ry = run_curve(model, ablator, inputs, targets, scope_heads)
             rand_res.append(ry)
             rand_x = rx
         
-        # Pad and mean
+        # Align lengths if needed (simple approach: trim to min)
         min_len = min([len(r) for r in rand_res])
         rand_res = [r[:min_len] for r in rand_res]
         rand_mean = np.mean(rand_res, axis=0)
@@ -386,24 +359,21 @@ def main():
         ax.plot(rand_x, rand_mean, color='blue', label='Random', alpha=0.8)
         ax.fill_between(rand_x, rand_mean-rand_std, rand_mean+rand_std, color='blue', alpha=0.1)
         
-        # --- Control (Black) REMOVED ---
-        
         # --- Run Ablation (Red) ---
         rx, ry = run_curve(model, ablator, inputs, targets, red_order)
         ax.plot(rx, ry, color='red', label='Ablation (High CMA first)')
         
-        # Style
         ax.set_title(title, fontweight='bold', fontsize=14)
         ax.set_xlabel("Number of heads ablated")
         ax.set_ylim(-0.05, 1.05)
         ax.grid(True, linestyle=':', alpha=0.4)
         
-        # --- 针对不同头数量调整 X 轴刻度 ---
-        total_heads = len(scope_heads)
-        if total_heads <= 16:
-            ax.set_xticks([0, 4, 8, 12, 16])
-        elif total_heads <= 128:
-            ax.set_xticks(np.arange(0, 129, 32))
+        # Ticks based on head count
+        total_heads_in_scope = len(scope_heads)
+        if total_heads_in_scope > 200: # Global (720)
+            ax.set_xticks(np.arange(0, total_heads_in_scope + 1, 100))
+        else: # Groups (240)
+            ax.set_xticks(np.arange(0, total_heads_in_scope + 1, 40))
         
         if idx == 0:
             ax.set_ylabel("P(Correct Answer)", fontsize=12)
@@ -411,8 +381,7 @@ def main():
             
     ablator.close()
     
-    # 保存为新文件
-    save_path = os.path.join(PLOT_DIR, "ablation_figure5_grouped_native_no_control_memorization.png")
+    save_path = os.path.join(PLOT_DIR, "ablation_gpt2_large_x_plus_y_wd0.0_100k.png")
     plt.savefig(save_path, bbox_inches='tight')
     print(f"\n✅ Plot saved to: {save_path}")
 

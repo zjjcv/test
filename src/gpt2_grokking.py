@@ -17,11 +17,11 @@ import multiprocessing
 
 
 # =============================================================================
-# 0. Runtime 设置（每个进程都会调用）
+# 0. Runtime Setting (Called by each process)
 # =============================================================================
 
 def setup_torch_runtime(args):
-    # TF32（Ada 4090 有效）
+    # TF32 (Effective on Ada 4090)
     if args.tf32:
         try:
             torch.set_float32_matmul_precision(args.matmul_precision)  # 'high'/'medium'
@@ -33,12 +33,12 @@ def setup_torch_runtime(args):
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
-    # cuDNN benchmark（对固定 shape 有利）
+    # cuDNN benchmark (Good for fixed input shapes)
     torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
 
 
 # =============================================================================
-# 1. 基础组件
+# 1. Basic Components
 # =============================================================================
 
 class SGLD(Optimizer):
@@ -68,11 +68,6 @@ class SGLD(Optimizer):
 
 
 class LLCEstimator:
-    """
-    修正点：
-    - 不再 deepcopy(可能与 torch.compile 冲突、且非常慢)
-    - 改为 model_ctor() 新建同构模型 + load_state_dict
-    """
     def __init__(self, model_ctor, criterion, dataloader, device):
         self.model_ctor = model_ctor
         self.criterion = criterion
@@ -131,7 +126,7 @@ class LLCEstimator:
 
 
 # =============================================================================
-# 2. GPT-2 Medium 架构（保持你原来的实现，且 dropout 强制为 0）
+# 2. GPT-2 Architecture Components
 # =============================================================================
 
 class CausalSelfAttention(nn.Module):
@@ -160,7 +155,6 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
 
         if mask is not None:
-            # mask: [T, T] with -inf above diagonal
             att = att + mask[:T, :T]
 
         att = F.softmax(att, dim=-1)
@@ -204,7 +198,6 @@ class GPT2Block(nn.Module):
 
 
 class GPT2Decoder(nn.Module):
-    # 注意：dropout 默认值改为 0.0（避免任何“默认污染”）
     def __init__(self, dim=1024, num_layers=24, num_heads=16, num_tokens=99, seq_len=5, dropout=0.0, use_checkpoint=True):
         super().__init__()
         self.token_embeddings = nn.Embedding(num_tokens, dim)
@@ -254,7 +247,7 @@ class GPT2Decoder(nn.Module):
 
 
 # =============================================================================
-# 3. 工具函数
+# 3. Utility Functions
 # =============================================================================
 
 def calc_l2_norm(model):
@@ -283,18 +276,27 @@ def calc_spectral_entropy(model):
 
 
 # =============================================================================
-# 4. 数据生成（只跑 x-y 也保持通用）
+# 4. Data Generation
 # =============================================================================
 
 def get_data(p, eq_token, op_token, task_name):
     x = torch.arange(p)
-    y = torch.arange(1, p)
+    # y ranges from 1 to p-1
+    y = torch.arange(1, p) 
     x, y = torch.cartesian_prod(x, y).T
     eq = torch.ones_like(x) * eq_token
     op = torch.ones_like(x) * op_token
 
-    if task_name == 'x-y':
+    if task_name == 'x+y':
+        result = (x + y) % p
+    elif task_name == 'x-y':
         result = (x - y) % p
+    elif task_name == 'x*y':
+        result = (x * y) % p
+    elif task_name == 'x/y':
+        # Modular inverse
+        y_inv = torch.pow(y, p - 2, p)
+        result = (x * y_inv) % p
     else:
         raise ValueError(f"Unknown task: {task_name}")
 
@@ -303,7 +305,7 @@ def get_data(p, eq_token, op_token, task_name):
 
 
 # =============================================================================
-# 5. 原子训练任务（保存逻辑按“上一个代码”）
+# 5. Atomic Training Task
 # =============================================================================
 
 def run_atomic_experiment(task_name, wd, seed, device_id, args):
@@ -311,7 +313,6 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
     torch.cuda.set_device(device_id)
     setup_torch_runtime(args)
 
-    # 严格禁止 dropout 非 0
     if abs(args.dropout) > 1e-12:
         raise ValueError("Dropout is forbidden by experiment setting. Please set --dropout 0.0")
 
@@ -320,13 +321,14 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
 
-    full_data = get_data(args.p, args.p, args.p + 1, task_name)
+    # Vocabulary size = args.p + 2.
+    full_data = get_data(args.p, args.p + 1, args.p, task_name)
+    
     indices = torch.randperm(len(full_data))
     split = int(len(full_data) * 0.5)
     train_data = full_data[indices[:split]]
     test_data = full_data[indices[split:]]
 
-    # 外层多进程 -> 这里必须 num_workers=0
     train_loader = DataLoader(TensorDataset(train_data), batch_size=args.batch_size, shuffle=True,
                               num_workers=0, pin_memory=True)
     llc_loader = DataLoader(TensorDataset(train_data), batch_size=args.batch_size, shuffle=False,
@@ -335,10 +337,11 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
                              num_workers=0, pin_memory=True)
 
     def model_ctor():
+        # --- MODIFIED: GPT-2 Medium Configuration ---
         return GPT2Decoder(
-            dim=1024, num_layers=24, num_heads=16,
+            dim=1024, num_layers=24, num_heads=16,  # GPT-2 Medium
             num_tokens=args.p + 2, seq_len=5,
-            dropout=0.0,  # 强制 0
+            dropout=0.0,
             use_checkpoint=bool(args.grad_ckpt)
         )
 
@@ -352,7 +355,6 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=wd, betas=(0.9, 0.98))
 
-    # AMP
     if args.precision == "bf16":
         amp_dtype = torch.bfloat16
         use_scaler = False
@@ -364,11 +366,14 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
 
     llc_estimator = LLCEstimator(model_ctor, F.cross_entropy, llc_loader, device)
 
-    # 保存目录（只保存到 results_base 下）
-    task_safe = task_name.replace("/", "_div_").replace("*", "_mul_").replace("+", "_plus_")
-    results_base = args.results_base
+    # --- Save Path Configuration (Updated for gpt2_medium) ---
+    task_safe = task_name.replace("/", "_div_").replace("*", "_mul_").replace("+", "_plus_").replace("-", "_minus_")
+    
+    # MODIFIED: Output path set to gpt2_medium
+    results_base = os.path.join("results", "gpt2_medium") 
     data_dir = os.path.join(results_base, "data", task_safe, f"wd_{wd}")
     checkpoint_dir = os.path.join(results_base, "checkpoints", task_safe, f"wd_{wd}")
+    
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -386,13 +391,11 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
     }
 
     steps = 0
-    print(f"[START] cuda:{device_id} task={task_name} wd={wd} seed={seed}")
 
-    # 只显示一个 step tqdm，避免多进程刷屏
-    show_step_pbar = (device_id == 0 and float(wd) == 0.0)
+    show_step_pbar = (device_id == 0)
     pbar = tqdm(
         total=args.budget,
-        desc=f"Steps | cuda:{device_id} wd:{wd} seed:{seed}",
+        desc=f"cuda:{device_id} {task_name} wd:{wd}",
         ncols=100,
         dynamic_ncols=True,
         leave=True,
@@ -427,21 +430,26 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
                 pbar.update(1)
 
                 if steps % 100 == 0:
-                    # train metric（当前 batch）
                     acc = (logits[:, -1, :].argmax(-1) == target).float().mean().item()
                     loss_val = float(loss.item())
 
-                    # test metric
                     model.eval()
                     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        # Full test set evaluation
+                        total_test_loss = 0.0
+                        total_test_acc = 0.0
+                        total_batches = 0
                         for (test_batch,) in test_loader:
                             test_batch = test_batch.to(device, non_blocking=True)
                             t_inp, t_target = test_batch[:, :-1], test_batch[:, -1]
                             t_logits = model(t_inp)
-                            test_loss = F.cross_entropy(t_logits[:, -1, :].float(), t_target).item()
-                            test_acc = (t_logits[:, -1, :].argmax(-1) == t_target).float().mean().item()
+                            total_test_loss += F.cross_entropy(t_logits[:, -1, :].float(), t_target).item()
+                            total_test_acc += (t_logits[:, -1, :].argmax(-1) == t_target).float().mean().item()
+                            total_batches += 1
+                        
+                        test_loss = total_test_loss / total_batches
+                        test_acc = total_test_acc / total_batches
 
-                    # LLC（保持：每 100 step 估一次）
                     llc_val = llc_estimator.estimate(model.state_dict(), num_draws=args.llc_draws, lr=args.llc_lr)
 
                     l2_val = calc_l2_norm(model)
@@ -456,7 +464,6 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
                     metrics['l2_norm'].append(float(l2_val))
                     metrics['spectral_entropy'].append(float(se_val))
 
-                    # ckpt：只保存指定步
                     if steps in checkpoint_steps:
                         ckpt_path = os.path.join(checkpoint_dir, f"seed{seed}_step{steps}.pt")
                         torch.save({
@@ -466,15 +473,7 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
                             'seed': seed,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            'metrics': {
-                                'train_loss': loss_val,
-                                'train_acc': float(acc),
-                                'test_loss': float(test_loss),
-                                'test_acc': float(test_acc),
-                                'llc': float(llc_val),
-                                'l2_norm': float(l2_val),
-                                'spectral_entropy': float(se_val)
-                            }
+                            'metrics': metrics
                         }, ckpt_path)
 
                 if steps >= args.budget:
@@ -482,7 +481,6 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
     finally:
         pbar.close()
 
-    # CSV：每 seed 一个文件
     csv_path = os.path.join(data_dir, f"seed{seed}.csv")
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -500,21 +498,24 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
 
 
 # =============================================================================
-# 6. GPU Worker：固定 GPU + 固定 wd（你要求的逻辑）
+# 6. GPU Worker
 # =============================================================================
 
-def run_gpu_worker_fixed_wd(gpu_id, wd, seeds, args):
+def run_gpu_worker_task(gpu_id, task_name, wd, seeds, args):
+    """
+    Run all seeds for a specific task and weight decay on a single GPU.
+    """
     torch.cuda.set_device(gpu_id)
     setup_torch_runtime(args)
 
     done = []
     for seed in seeds:
-        done.append(run_atomic_experiment(task_name="x-y", wd=wd, seed=seed, device_id=gpu_id, args=args))
+        done.append(run_atomic_experiment(task_name=task_name, wd=wd, seed=seed, device_id=gpu_id, args=args))
     return done
 
 
 # =============================================================================
-# 7. 主程序：cuda0->wd=0.0, cuda1->wd=1.0
+# 7. Main Program: 8 Tasks on 8 GPUs
 # =============================================================================
 
 def parse_seeds(seed_str: str):
@@ -529,7 +530,6 @@ def main():
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
 
-    # 性能开关
     parser.add_argument("--precision", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--tf32", type=int, default=1)
     parser.add_argument("--matmul_precision", type=str, default="medium", choices=["high", "medium"])
@@ -539,62 +539,62 @@ def main():
     parser.add_argument("--compile_mode", type=str, default="max-autotune",
                         choices=["default", "reduce-overhead", "max-autotune"])
 
-    # 实验约束（dropout 严禁非 0）
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--grad_ckpt", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
-    # LLC
     parser.add_argument("--llc_draws", type=int, default=20)
     parser.add_argument("--llc_lr", type=float, default=1e-4)
 
-    # 默认两个种子（你说“只要两个种子就行”）
     parser.add_argument("--seeds", type=str, default="42")
-
-    # 只保存到 results_base
-    parser.add_argument("--results_base", type=str, default="/data/zjj/test/results")
 
     args = parser.parse_args()
 
-    # 严格禁止 dropout 非0（提前失败）
     if abs(args.dropout) > 1e-12:
-        raise ValueError("Dropout is forbidden by experiment setting. Please set --dropout 0.0")
+        raise ValueError("Dropout is forbidden. Please set --dropout 0.0")
 
-    # 只用两张卡（剩下六张卡你跑别的）
-    required_gpus = 2
+    required_gpus = 8
     ngpu = torch.cuda.device_count()
     assert ngpu >= required_gpus, f"Need at least {required_gpus} GPUs, but found {ngpu}."
 
     seeds = parse_seeds(args.seeds)
 
-    # 固定映射：cuda0->wd=0.0, cuda1->wd=1.0
-    mapping = [(0, 0.0), (1, 1.0)]
+    # Task Assignment: (gpu_id, task_name, wd)
+    assignments = [
+        (0, 'x+y', 0.0),
+        (1, 'x+y', 1.0),
+        (2, 'x-y', 0.0),
+        (3, 'x-y', 1.0),
+        (4, 'x*y', 0.0),
+        (5, 'x*y', 1.0),
+        (6, 'x/y', 0.0),
+        (7, 'x/y', 1.0)
+    ]
 
-    total_runs = len(seeds) * len(mapping)
-    print(f"GPUs used: cuda:0 (wd=0.0), cuda:1 (wd=1.0)")
-    print(f"Task: x-y | Seeds: {seeds} | Total runs: {total_runs}")
-    print(f"Precision: {args.precision} | TF32: {bool(args.tf32)} | compile: {bool(args.use_compile)}")
-    print(f"Results base: {args.results_base}")
-    print(f"CSV: {args.results_base}/data/x-y/wd_*/seed*.csv")
-    print(f"CKPT: {args.results_base}/checkpoints/x-y/wd_*/seed*_step*.pt")
+    print(f"GPUs used: 8 (cuda:0-7)")
+    print(f"Architecture: GPT-2 Medium (dim=1024, L=24, H=16)")
+    print(f"Assignments:")
+    for gpu, t, w in assignments:
+        print(f"  cuda:{gpu} -> Task: {t}, WD: {w}")
+    print(f"Seeds: {seeds}")
+    print(f"Output Directory: results/gpt2_medium/")
 
-    # spawn，避免 CUDA+fork 问题
+    # Use 'spawn' to avoid CUDA issues with fork
     ctx = multiprocessing.get_context("spawn")
 
     with ProcessPoolExecutor(max_workers=required_gpus, mp_context=ctx) as executor:
         futures = []
-        for gpu_id, wd in mapping:
-            futures.append(executor.submit(run_gpu_worker_fixed_wd, gpu_id, wd, seeds, args))
+        for gpu_id, task_name, wd in assignments:
+            futures.append(executor.submit(run_gpu_worker_task, gpu_id, task_name, wd, seeds, args))
 
-        overall = tqdm(total=total_runs, desc="Overall Progress", ncols=100)
-
+        # Overall progress bar
+        overall = tqdm(total=len(assignments) * len(seeds), desc="Total Progress", ncols=100)
         for fut in as_completed(futures):
             done_list = fut.result()
             overall.update(len(done_list))
-
         overall.close()
 
-    print("All Done.")
+    print("All Experiments Done.")
 
 
 if __name__ == "__main__":
