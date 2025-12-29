@@ -41,89 +41,7 @@ def setup_torch_runtime(args):
 # 1. Basic Components
 # =============================================================================
 
-class SGLD(Optimizer):
-    def __init__(self, params, lr=1e-4, noise_scale=1.0):
-        defaults = dict(lr=lr, noise_scale=noise_scale)
-        super(SGLD, self).__init__(params, defaults)
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-            lr = group['lr']
-            noise_scale = group['noise_scale']
-            for p in group['params']:
-                if p.grad is None:
-                    continue
-                d_p = p.grad.data
-                p.data.add_(d_p, alpha=-0.5 * lr)
-
-                noise_std = torch.sqrt(torch.tensor(lr, device=p.data.device)) * noise_scale
-                noise = torch.randn_like(p.data) * noise_std
-                p.data.add_(noise)
-
-        return loss
-
-
-class LLCEstimator:
-    def __init__(self, model_ctor, criterion, dataloader, device):
-        self.model_ctor = model_ctor
-        self.criterion = criterion
-        self.dataloader = dataloader
-        self.device = device
-
-    def estimate(self, current_weights_dict, num_draws=40, lr=1e-4, epsilon=1.0):
-        sampling_model = self.model_ctor().to(self.device)
-        sampling_model.load_state_dict(current_weights_dict)
-
-        base_loss = self._compute_full_loss(sampling_model)
-
-        sampling_model.train()
-        sgld_optim = SGLD(sampling_model.parameters(), lr=lr, noise_scale=epsilon)
-
-        loss_trace = []
-        iter_dl = iter(self.dataloader)
-
-        for _ in range(num_draws):
-            try:
-                batch = next(iter_dl)
-            except StopIteration:
-                iter_dl = iter(self.dataloader)
-                batch = next(iter_dl)
-
-            batch_x = batch[0].to(self.device, non_blocking=True)
-            inp, target = batch_x[:, :-1], batch_x[:, -1]
-
-            sgld_optim.zero_grad(set_to_none=True)
-            logits = sampling_model(inp)
-            loss = self.criterion(logits[:, -1, :], target)
-            loss.backward()
-            sgld_optim.step()
-            loss_trace.append(loss.item())
-
-        avg_sampling_loss = float(np.mean(loss_trace))
-        llc_proxy = avg_sampling_loss - base_loss
-
-        del sampling_model
-        torch.cuda.empty_cache()
-        return llc_proxy
-
-    def _compute_full_loss(self, model):
-        model.eval()
-        total_loss = 0.0
-        total_count = 0
-        with torch.no_grad():
-            for batch in self.dataloader:
-                batch_x = batch[0].to(self.device, non_blocking=True)
-                inp, target = batch_x[:, :-1], batch_x[:, -1]
-                logits = model(inp)
-                loss = self.criterion(logits[:, -1, :], target)
-                total_loss += loss.item() * batch_x.size(0)
-                total_count += batch_x.size(0)
-        return total_loss / max(total_count, 1)
-
+# (Removed SGLD and LLCEstimator as requested for simplification)
 
 # =============================================================================
 # 2. GPT-2 Architecture Components
@@ -250,30 +168,7 @@ class GPT2Decoder(nn.Module):
 # 3. Utility Functions
 # =============================================================================
 
-def calc_l2_norm(model):
-    total_norm = 0.0
-    for p in model.parameters():
-        param_norm = p.data.norm(2)
-        total_norm += param_norm.item() ** 2
-    return total_norm ** 0.5
-
-
-def calc_spectral_entropy(model):
-    total_entropy = 0.0
-    num_matrices = 0
-    for _, param in model.named_parameters():
-        if len(param.shape) >= 2:
-            try:
-                with torch.no_grad():
-                    s = torch.linalg.svdvals(param.data.float())
-                    s_normalized = s / (s.sum() + 1e-10)
-                    entropy = -(s_normalized * torch.log(s_normalized + 1e-10)).sum().item()
-                    total_entropy += entropy
-                    num_matrices += 1
-            except Exception:
-                continue
-    return total_entropy / max(num_matrices, 1)
-
+# (Removed calc_l2_norm and calc_spectral_entropy as requested)
 
 # =============================================================================
 # 4. Data Generation
@@ -364,15 +259,15 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
 
     scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
-    llc_estimator = LLCEstimator(model_ctor, F.cross_entropy, llc_loader, device)
+    # (Removed LLCEstimator init)
 
     # --- Save Path Configuration (Updated for gpt2_medium) ---
     task_safe = task_name.replace("/", "_div_").replace("*", "_mul_").replace("+", "_plus_").replace("-", "_minus_")
     
     # MODIFIED: Output path set to gpt2_medium
-    results_base = os.path.join("results", "gpt2_medium") 
-    data_dir = os.path.join(results_base, "data", task_safe, f"wd_{wd}")
-    checkpoint_dir = os.path.join(results_base, "checkpoints", task_safe, f"wd_{wd}")
+    results_base = os.path.join("results") 
+    data_dir = os.path.join(results_base, "Data/x-y", task_safe, f"wd_{wd}")
+    checkpoint_dir = os.path.join(results_base, "Checkpoints/gpt2_medium", task_safe, f"wd_{wd}")
     
     os.makedirs(data_dir, exist_ok=True)
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -384,10 +279,7 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
         'train_loss': [],
         'train_acc': [],
         'test_loss': [],
-        'test_acc': [],
-        'llc': [],
-        'l2_norm': [],
-        'spectral_entropy': []
+        'test_acc': []
     }
 
     steps = 0
@@ -450,19 +342,11 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
                         test_loss = total_test_loss / total_batches
                         test_acc = total_test_acc / total_batches
 
-                    llc_val = llc_estimator.estimate(model.state_dict(), num_draws=args.llc_draws, lr=args.llc_lr)
-
-                    l2_val = calc_l2_norm(model)
-                    se_val = calc_spectral_entropy(model)
-
                     metrics['steps'].append(steps)
                     metrics['train_loss'].append(loss_val)
                     metrics['train_acc'].append(float(acc))
                     metrics['test_loss'].append(float(test_loss))
                     metrics['test_acc'].append(float(test_acc))
-                    metrics['llc'].append(float(llc_val))
-                    metrics['l2_norm'].append(float(l2_val))
-                    metrics['spectral_entropy'].append(float(se_val))
 
                     if steps in checkpoint_steps:
                         ckpt_path = os.path.join(checkpoint_dir, f"seed{seed}_step{steps}.pt")
@@ -491,7 +375,7 @@ def run_atomic_experiment(task_name, wd, seed, device_id, args):
     final_test_acc = metrics['test_acc'][-1] if metrics['test_acc'] else 0.0
     print(f"✓ [DONE] cuda:{device_id} task={task_name} wd={wd} seed={seed} | Train={final_train_acc:.3f} Test={final_test_acc:.3f}")
 
-    del model, optimizer, scaler, llc_estimator
+    del model, optimizer, scaler
     torch.cuda.empty_cache()
 
     return (task_name, wd, seed)
@@ -553,7 +437,7 @@ def main():
     if abs(args.dropout) > 1e-12:
         raise ValueError("Dropout is forbidden. Please set --dropout 0.0")
 
-    required_gpus = 8
+    required_gpus = 2
     ngpu = torch.cuda.device_count()
     assert ngpu >= required_gpus, f"Need at least {required_gpus} GPUs, but found {ngpu}."
 
@@ -561,17 +445,11 @@ def main():
 
     # Task Assignment: (gpu_id, task_name, wd)
     assignments = [
-        (0, 'x+y', 0.0),
-        (1, 'x+y', 1.0),
-        (2, 'x-y', 0.0),
-        (3, 'x-y', 1.0),
-        (4, 'x*y', 0.0),
-        (5, 'x*y', 1.0),
-        (6, 'x/y', 0.0),
-        (7, 'x/y', 1.0)
+        (0, 'x-y', 0.0),
+        (1, 'x-y', 1.0)
     ]
 
-    print(f"GPUs used: 8 (cuda:0-7)")
+    print(f"GPUs used: 2 (cuda:0-1)")
     print(f"Architecture: GPT-2 Medium (dim=1024, L=24, H=16)")
     print(f"Assignments:")
     for gpu, t, w in assignments:

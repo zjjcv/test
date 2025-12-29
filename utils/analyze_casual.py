@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import math
@@ -21,8 +22,8 @@ STEPS = [100, 1000, 10000, 100000]
 WD_SETTINGS = ['wd_0.0', 'wd_1.0'] # Row 0, Row 1
 
 # Updated Path for GPT2-Large x_plus_y task
-BASE_CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'results', 'gpt2_medium', 'checkpoints', 'x_minus_y')
-PLOT_DIR = os.path.join(PROJECT_ROOT, 'results', 'analysis_plots')
+BASE_CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, 'results', 'Checkpoints/gpt2_medium/x_minus_y')
+PLOT_DIR = os.path.join(PROJECT_ROOT, 'results', 'Data')
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 # Modulo Arithmetic Parameter
@@ -177,10 +178,10 @@ class CausalTracer:
     def run_cma(self, c1_ids, c2_ids, target_idx_c1, target_idx_c2):
         with torch.no_grad():
             clean_output = self.model(c1_ids)
-            # --- 修改开始: 转换为概率 ---
-            clean_probs = F.softmax(clean_output.logits, dim=-1) 
-            base_clean_prob = clean_probs[0, -1, target_idx_c1]
-            # --- 修改结束 ---
+            # --- Logit Diff: Source_Target - Input_Target ---
+            clean_logits = clean_output.logits[0, -1]
+            base_logitdiff = (clean_logits[target_idx_c2] - clean_logits[target_idx_c1]).item()
+            # ------------------------------------------------
 
         source_acts = self.get_activations(c2_ids)
         effect_matrix = torch.zeros((self.n_layers, self.n_heads))
@@ -202,15 +203,15 @@ class CausalTracer:
                 handle = layer_module.register_forward_pre_hook(single_head_patch_hook)
                 with torch.no_grad():
                     patched_output = self.model(c1_ids)
-                    # --- 修改开始: 转换为概率 ---
-                    patched_probs = F.softmax(patched_output.logits, dim=-1)
-                    patched_clean_prob = patched_probs[0, -1, target_idx_c1]
-                    # --- 修改结束 ---
+                    # --- Logit Diff: Source_Target - Input_Target ---
+                    patched_logits = patched_output.logits[0, -1]
+                    patched_logitdiff = (patched_logits[target_idx_c2] - patched_logits[target_idx_c1]).item()
+                    # ------------------------------------------------
                 
                 handle.remove()
                 
-                # 计算概率差
-                effect_matrix[layer_idx, head_idx] = (base_clean_prob - patched_clean_prob).item()
+                # Effect = Patched - Base
+                effect_matrix[layer_idx, head_idx] = patched_logitdiff - base_logitdiff
         
         return effect_matrix
 
@@ -220,15 +221,16 @@ class CausalTracer:
 
 def generate_mod_data_x_plus_y():
     """ 生成 x + y (mod P) 的对照样本 """
-    a = np.random.randint(0, P)
+    a1 = np.random.randint(0, P)
+    a2 = np.random.randint(0, P)
     b1 = np.random.randint(0, P)
     b2 = (b1 + np.random.randint(1, P)) % P 
-    c1 = (a + b1) % P # Changed to + for x_plus_y task
-    c2 = (a + b2) % P
+    c1 = (a1 - b1) % P # Changed to + for x_plus_y task
+    c2 = (a1 + b2) % P
     # 格式: x op y eq -> result
     # P=97, so op_token=97, eq_token=98
-    prompt_c1 = f"{a} {P} {b1} {P+1}" 
-    prompt_c2 = f"{a} {P} {b2} {P+1}"
+    prompt_c1 = f"{a1} {P} {b1} {P+1}" 
+    prompt_c2 = f"{a1} {P} {b2} {P+1}"
     return prompt_c1, prompt_c2, c1, c2
 
 class ModTokenizer:
@@ -294,6 +296,24 @@ def main():
             except Exception as e:
                 print(f"  [Error] Failed to process {ckpt_path}: {e}")
                 heatmap_data_cache[(row_idx, col_idx)] = torch.zeros((36, 20))
+
+    # --- Save Data to CSV ---
+    DATA_SAVE_DIR = os.path.join(PLOT_DIR, "cma")
+    os.makedirs(DATA_SAVE_DIR, exist_ok=True)
+    print(f"💾 Saving raw heatmap data to {DATA_SAVE_DIR}...")
+
+    for (r_idx, c_idx), heatmap_tensor in heatmap_data_cache.items():
+        wd_val = WD_SETTINGS[r_idx]
+        step_val = STEPS[c_idx]
+        csv_filename = f"cma_{wd_val}_step_{step_val}.csv"
+        csv_full_path = os.path.join(DATA_SAVE_DIR, csv_filename)
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(heatmap_tensor.numpy())
+        df.index.name = "Layer"
+        df.columns.name = "Head"
+        df.to_csv(csv_full_path)
+        print(f"  -> Saved {csv_filename}")
 
     # --- Plotting ---
     print("🎨 Rendering plots...")
@@ -361,7 +381,7 @@ def main():
     cbar.set_label("Causal Mediation Effect (Probability Difference)", fontsize=12, labelpad=10)
     cbar.outline.set_visible(False)
 
-    save_path = os.path.join(PLOT_DIR, "cma_gpt2_medium_x_medium_y.png")
+    save_path = os.path.join("/data/zjj/test/results/Figure", "cma_gpt2_medium_x_minus_y.png")
     plt.savefig(save_path, bbox_inches='tight', dpi=300)
     print(f"\n✨ 最终图表已保存到: {save_path}")
 
