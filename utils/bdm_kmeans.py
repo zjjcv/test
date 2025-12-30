@@ -3,325 +3,324 @@ import numpy as np
 import pandas as pd
 import os
 import glob
-from sklearn.cluster import KMeans
 from tqdm import tqdm
 import sys
+import warnings
+import gzip
+from collections import Counter
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
 
 # Try to import pybdm
 try:
     from pybdm import BDM
+    PYBDM_AVAILABLE = True
 except ImportError:
-    print("Error: pybdm library not found. Please install it using: pip install pybdm")
-    BDM = None
+    print("Warning: pybdm library not found. Using Gzip fallback.")
+    PYBDM_AVAILABLE = False
 
-def z_score_normalization(weights):
+def quantile_binning(weights):
     """
-    Normalize weights using Z-Score (Standardization).
+    Discretize weights using quantile-based hard binning (0-3).
+    bins = np.quantile(weights, [0.25, 0.5, 0.75])
     """
-    mean = np.mean(weights)
-    std = np.std(weights)
-    if std == 0:
-        return np.zeros_like(weights)
-    return (weights - mean) / std
+    # Handle edge case of constant weights
+    if np.min(weights) == np.max(weights):
+        return np.zeros_like(weights, dtype=int)
+        
+    quantiles = np.quantile(weights, [0.25, 0.5, 0.75])
+    # np.digitize returns 0 for x < q1, 1 for q1 <= x < q2, etc.
+    # bins: (-inf, q1), [q1, q2), [q2, q3), [q3, inf) -> 0, 1, 2, 3
+    return np.digitize(weights, quantiles)
 
-def quantize_weights(weights, n_clusters=4):
+def calculate_block_bdm(matrix, bdm_solver, block_size=(4, 4), use_gzip=False):
     """
-    Quantize continuous weights into discrete symbols (0 to n_clusters-1) using K-Means.
+    Calculate BDM using non-overlapping block decomposition + frequency aggregation.
+    Formula: Sum_{unique_block u} ( K(u) + log2(count_u) )
     """
-    # Reshape to 1D for clustering
-    shape = weights.shape
-    weights_flat = weights.reshape(-1, 1)
+    h, w = matrix.shape
+    bh, bw = block_size
     
-    # K-Means clustering
-    # n_init='auto' or explicit integer to suppress warnings
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(weights_flat)
+    # Pad matrix to be divisible by block size
+    pad_h = (bh - h % bh) % bh
+    pad_w = (bw - w % bw) % bw
+    if pad_h > 0 or pad_w > 0:
+        matrix = np.pad(matrix, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
     
-    # Reshape back to original shape
-    quantized = labels.reshape(shape)
-    return quantized
+    h_pad, w_pad = matrix.shape
+    
+    # Extract blocks
+    # Reshape to (h//bh, bh, w//bw, bw) and swap axes to (h//bh, w//bw, bh, bw)
+    # Then reshape to (-1, bh, bw)
+    n_rows = h_pad // bh
+    n_cols = w_pad // bw
+    
+    blocks = matrix.reshape(n_rows, bh, n_cols, bw).swapaxes(1, 2).reshape(-1, bh, bw)
+    
+    # Convert to tuples for hashing/counting
+    # Flatten each block to tuple
+    block_tuples = [tuple(b.flatten()) for b in blocks]
+    counts = Counter(block_tuples)
+    
+    total_complexity = 0
+    
+    # Calculate complexity for each unique block
+    for block_tuple, count in counts.items():
+        # Reconstruct block
+        block_arr = np.array(block_tuple, dtype=np.int8).reshape(bh, bw)
+        
+        k_u = 0
+        if use_gzip or bdm_solver is None:
+            # Gzip proxy
+            k_u = len(gzip.compress(block_arr.tobytes()))
+        else:
+            try:
+                # pybdm expects integer array
+                # Ensure it's the right type/shape
+                k_u = bdm_solver.bdm(block_arr)
+                if k_u == 0: # Fallback if 0
+                     k_u = len(gzip.compress(block_arr.tobytes()))
+            except:
+                k_u = len(gzip.compress(block_arr.tobytes()))
+        
+        # Add entropy term: log2(count)
+        # If a block repeats N times, we describe it once (K(u)) and specify N positions?
+        # The standard BDM aggregation for a dataset is sum(BDM(u) + log2(n_u))
+        term = k_u + np.log2(count)
+        total_complexity += term
+        
+    return total_complexity
 
-import gzip
-
-# ... (imports)
-
-def calculate_complexity(quantized_weights, bdm_solver=None, use_gzip=False):
+def process_layer(weights, bdm_solver, use_gzip=False):
     """
-    Calculate Complexity: BDM or Gzip (as proxy).
+    Process a single weight matrix: Quantile Binning -> Block BDM.
     """
-    # Ensure integer type
-    data = np.ascontiguousarray(quantized_weights.astype(np.int8))
+    # 1. Quantile Binning (Hard Discretization)
+    quantized = quantile_binning(weights)
     
-    if use_gzip or bdm_solver is None:
-        # Gzip Compression Size as KC proxy
-        # Convert to bytes
-        return len(gzip.compress(data.tobytes()))
+    # 2. Block BDM Calculation
+    kc = calculate_block_bdm(quantized, bdm_solver, block_size=(4, 4), use_gzip=use_gzip)
     
-    try:
-        val = bdm_solver.bdm(data)
-        if val == 0:
-            # Fallback if BDM returns 0 (unexpected)
-            return len(gzip.compress(data.tobytes()))
-        return val
-    except Exception as e:
-        # Fallback
-        return len(gzip.compress(data.tobytes()))
+    return kc, quantized
+
+def find_best_tensor_dict(obj, max_depth=6):
+    """
+    在嵌套 dict/list/tuple 中递归寻找：包含最多 torch.Tensor 的 dict。
+    返回 (best_dict, tensor_count)；若找不到返回 (None, 0)
+    """
+    best = (None, 0)
+
+    def count_tensors_in_dict(d):
+        return sum(1 for v in d.values() if isinstance(v, torch.Tensor))
+
+    def dfs(x, depth):
+        nonlocal best
+        if depth > max_depth:
+            return
+        if isinstance(x, dict):
+            c = count_tensors_in_dict(x)
+            if c > best[1]:
+                best = (x, c)
+
+            # 优先沿常见 key 深入
+            priority_keys = [
+                "model_state_dict", "state_dict", "model", "module", "net",
+                "params", "weights", "optimizer", "state", "ema"
+            ]
+            for k in priority_keys:
+                if k in x:
+                    dfs(x[k], depth + 1)
+
+            # 也遍历所有值
+            for v in x.values():
+                dfs(v, depth + 1)
+
+        elif isinstance(x, (list, tuple)):
+            for v in x:
+                dfs(v, depth + 1)
+
+    dfs(obj, 0)
+    return best
+
+def extract_state_dict(ckpt):
+    # 1) 常见扁平格式直接命中
+    if isinstance(ckpt, dict):
+        for k in ["model_state_dict", "state_dict"]:
+            if k in ckpt and isinstance(ckpt[k], dict):
+                sd = ckpt[k]
+                if any(isinstance(v, torch.Tensor) for v in sd.values()):
+                    return sd
+
+        # 2) 常见深层结构
+        for k in ["model", "module", "net", "state"]:
+            if k in ckpt:
+                sd, cnt = find_best_tensor_dict(ckpt[k])
+                if cnt > 0:
+                    return sd
+
+    # 3) 递归兜底：全对象搜索
+    sd, cnt = find_best_tensor_dict(ckpt)
+    return sd
 
 def main():
-    # ...
-    
-    # 2. Initialize BDM
-    bdm = None
-    use_gzip = False
-    
-    if BDM is not None:
-        print("Initializing BDM solver...")
-        n_clusters = 4
-        try:
-            bdm = BDM(ndim=2, alphabet=n_clusters)
-            # Self-test
-            test_mat = np.random.randint(0, n_clusters, (20, 20), dtype=int)
-            test_score = bdm.bdm(test_mat)
-            print(f"BDM Test Score: {test_score}")
-            if test_score == 0:
-                print("BDM returned 0 for random matrix. Switching to Gzip proxy.")
-                use_gzip = True
-        except Exception as e:
-            print(f"BDM Init failed ({e}). Switching to Gzip proxy.")
-            use_gzip = True
-    else:
-        print("pybdm not found. Using Gzip proxy.")
-        use_gzip = True
-
-    # ...
-    
-    # In loop:
-    # kc = calculate_complexity(quantized, bdm, use_gzip)
-
-
-def process_2d_matrix(weights, bdm_solver, n_clusters=4, use_gzip=False):
-    """
-    Helper to process a single 2D weight matrix: Normalize -> Quantize -> Complexity.
-    Returns: (kc_value, quantized_matrix, normalized_matrix)
-    """
-    # A. Z-Score Normalization
-    norm_weights = z_score_normalization(weights)
-    
-    # B. Adaptive Quantization (K-Means)
-    quantized = quantize_weights(norm_weights, n_clusters=n_clusters)
-    
-    # C. Complexity Calculation
-    kc = calculate_complexity(quantized, bdm_solver, use_gzip=use_gzip)
-    
-    return kc, quantized, norm_weights
-
-def main():
-    if BDM is None:
-        print("Exiting due to missing pybdm library.")
-        return
-
-    # 1. Define Paths
+    # 1. Configuration
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    # Target Checkpoint Directory: results/checkpoint_transformer_2_4_128/x_minus_y/wd_1.0
-    # Adjust this path if your checkpoints are located elsewhere
     checkpoint_dir = os.path.join(base_dir, "results", "checkpoint_transformer_2_4_128", "x-y", "wd_1.0")
-    
-    # Output Directory
     output_dir = os.path.join(base_dir, "results", "Data", "BDM")
     os.makedirs(output_dir, exist_ok=True)
     
-    print(f"Looking for checkpoints in: {checkpoint_dir}")
-    
-    # 2. Initialize BDM
+    print(f"Input Directory: {checkpoint_dir}")
+    print(f"Output Directory: {output_dir}")
+
+    # 2. Initialize BDM Solver
     bdm = None
     use_gzip = False
-    n_clusters = 4
+    n_clusters = 4 # 4 bins -> alphabet size 4
     
-    if BDM is not None:
-        print("Initializing BDM solver...")
+    if PYBDM_AVAILABLE:
+        print(f"Initializing BDM solver with alphabet={n_clusters}...")
         try:
             bdm = BDM(ndim=2, alphabet=n_clusters)
             # Self-test
-            test_mat = np.random.randint(0, n_clusters, (20, 20), dtype=int)
+            test_mat = np.random.randint(0, n_clusters, (4, 4), dtype=int)
             test_score = bdm.bdm(test_mat)
-            print(f"BDM Test Score: {test_score}")
+            print(f"BDM Test Score (4x4): {test_score}")
             if test_score == 0:
-                print("BDM returned 0 for random matrix. Switching to Gzip proxy.")
+                print("BDM returned 0. Switching to Gzip proxy.")
                 use_gzip = True
         except TypeError:
-             # Fallback
-            print("Warning: BDM alphabet param issue. Trying default.")
+            print("Warning: BDM alphabet param not supported. Using default.")
             try:
                 bdm = BDM(ndim=2)
-                test_score = bdm.bdm(np.random.randint(0, 2, (20, 20), dtype=int))
-                if test_score == 0: use_gzip = True
             except:
                 use_gzip = True
         except Exception as e:
-            print(f"BDM Init failed ({e}). Switching to Gzip proxy.")
+            print(f"BDM Init failed: {e}. Using Gzip proxy.")
             use_gzip = True
     else:
         print("pybdm not found. Using Gzip proxy.")
         use_gzip = True
 
-    if use_gzip:
-        print("Using Gzip Compression Size as Kolmogorov Complexity Proxy.")
-    
-    # 3. Find and Sort Checkpoints
+    # 3. Find Checkpoints
     pattern = os.path.join(checkpoint_dir, "*.pt")
     files = glob.glob(pattern)
     
-    # Filter for seed 42 (consistent trajectory)
     checkpoints = []
     for fpath in files:
         fname = os.path.basename(fpath)
         if "seed42" in fname:
             try:
-                # Expected format: seed42_step100.pt or similar
                 parts = fname.replace('.pt', '').split('_')
                 step = None
                 for part in parts:
                     if part.startswith('step'):
                         step = int(part.replace('step', ''))
                         break
-                
                 if step is not None:
                     checkpoints.append((step, fpath))
-            except Exception:
+            except:
                 pass
     
-    # Sort by step
     checkpoints.sort(key=lambda x: x[0])
     
     if not checkpoints:
-        print("No checkpoints found matching 'seed42' and 'step*'.")
+        print("No checkpoints found.")
         return
 
-    print(f"Found {len(checkpoints)} checkpoints. Starting processing...")
+    print(f"Found {len(checkpoints)} checkpoints.")
 
-    # 4. Define Sampling Strategy for Heatmaps
-    # Fixed steps as requested: 100, 1000, 10000, 100000
-    target_steps = [100, 1000, 10000, 100000]
-    available_steps = {c[0] for c in checkpoints}
-    sample_steps = set()
-    
-    for t in target_steps:
-        if t in available_steps:
-            sample_steps.add(t)
-    
-    print(f"Sampling quantized weights for steps: {sorted(list(sample_steps))}")
-    
-    if not sample_steps:
-        print(f"Warning: No target steps found in checkpoints. Available steps (first 10): {sorted(list(available_steps))[:10]}")
+    # 4. Define Sampling Steps
+    target_sample_steps = [100, 1000, 10000, 100000]
     
     results = []
     quantized_samples = {}
-    normalized_samples = {}
     
-    # 5. Process Checkpoints
-    for step, fpath in tqdm(checkpoints, desc="Calculating KC"):
+    # 5. Process Loop
+    for step, fpath in tqdm(checkpoints, desc="Processing"):
         try:
-            # Load model
-            model_data = torch.load(fpath, map_location='cpu')
-            if isinstance(model_data, dict) and 'model' in model_data:
-                state_dict = model_data['model']
-            else:
-                state_dict = model_data
+            model_data = torch.load(fpath, map_location="cpu")
+            state_dict = extract_state_dict(model_data)
             
+            tensor_cnt = 0
+            mat2_cnt = 0
+            mat3_cnt = 0
+
+            if state_dict is None:
+                print(f"[Step {step}] No tensor dict found in checkpoint: {fpath}")
+                continue
+
+            tensor_cnt = sum(isinstance(v, torch.Tensor) for v in state_dict.values())
+            mat2_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==2 for v in state_dict.values())
+            mat3_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==3 for v in state_dict.values())
+            print(f"[Step {step}] tensors={tensor_cnt}, 2D={mat2_cnt}, 3D={mat3_cnt}")
+
             total_kc = 0
+            layer_count = 0
             
-            # Iterate through all parameters
             for name, param in state_dict.items():
                 if not isinstance(param, torch.Tensor):
                     continue
                 
-                # DEBUG: Print layer names for the first checkpoint to help debug selection
-                if step == checkpoints[0][0] and not results: 
-                    # Only print for the very first file processed
-                    print(f"DEBUG: Layer found: {name} | Shape: {param.shape} | Dim: {param.dim()}")
-
-                # Process 2D weight matrices (Linear, Embedding)
+                # Process 2D matrices
                 if param.dim() == 2:
                     weights = param.detach().cpu().numpy()
-                    kc, quantized, norm_weights = process_2d_matrix(weights, bdm, n_clusters=n_clusters, use_gzip=use_gzip)
+                    kc, quantized = process_layer(weights, bdm, use_gzip=use_gzip)
                     total_kc += kc
+                    layer_count += 1
                     
-                    # Save Sample
-                    if step in sample_steps:
-                        sample_key = f"step_{step}_{name}"
-                        quantized_samples[sample_key] = quantized
-                        normalized_samples[sample_key] = norm_weights
+                    if step in target_sample_steps:
+                        quantized_samples[f"step_{step}_{name}"] = quantized
 
-                # Process 3D weight matrices (e.g. Multi-head Attention weights stored as [num_heads, d_head, d_model])
+                # Process 3D matrices (Heads)
                 elif param.dim() == 3:
-                    # Iterate over the first dimension (e.g. heads)
                     for i in range(param.shape[0]):
                         weights = param[i].detach().cpu().numpy()
-                        kc, quantized, norm_weights = process_2d_matrix(weights, bdm, n_clusters=n_clusters, use_gzip=use_gzip)
+                        kc, quantized = process_layer(weights, bdm, use_gzip=use_gzip)
                         total_kc += kc
                         
-                        # Save Sample (append index to name)
-                        if step in sample_steps:
-                            sample_key = f"step_{step}_{name}_dim0_{i}"
-                            quantized_samples[sample_key] = quantized
-                            normalized_samples[sample_key] = norm_weights
-                
-                # Process 4D weight matrices (e.g. Conv2D [out, in, k, k]) - Treat as collection of 2D filters?
-                # Or just skip for now unless requested.
-                # For now, we focus on 2D and 3D.
+                        if step in target_sample_steps:
+                            quantized_samples[f"step_{step}_{name}_dim0_{i}"] = quantized
 
-            results.append({'Step': step, 'Total_BDM_Value': total_kc})
-
-            results.append({'Step': step, 'Total_BDM_Value': total_kc})
+            results.append({
+                'Step': step,
+                'Total_BDM_Value': total_kc,
+                'Layer_Count': layer_count
+            })
             
         except Exception as e:
-            print(f"Error processing step {step}: {e}")
-            continue
+            print(f"Error step {step}: {e}")
 
     # 6. Save Results
-    # Trajectory CSV
-    df_results = pd.DataFrame(results)
-    traj_path = os.path.join(output_dir, "bdm_trajectory.csv")
-    df_results.to_csv(traj_path, index=False)
-    print(f"\nSaved BDM trajectory to: {traj_path}")
-    
-    # Quantized Samples CSV
-    samples_dfs = []
-    for key, matrix in quantized_samples.items():
-        # Parse key: step_{step}_{name}
-        parts = key.split('_')
-        step_val = parts[1]
-        layer_name = "_".join(parts[2:])
-        
-        # Create DataFrame from matrix
-        df_mat = pd.DataFrame(matrix)
-        # Rename columns to col_0, col_1, ...
-        df_mat.columns = [f'col_{i}' for i in range(df_mat.shape[1])]
-        
-        # Add metadata columns
-        df_mat['step'] = step_val
-        df_mat['layer'] = layer_name
-        df_mat['row_idx'] = range(df_mat.shape[0])
-        
-        # Reorder columns to put metadata first
-        cols = ['step', 'layer', 'row_idx'] + [c for c in df_mat.columns if c.startswith('col_')]
-        df_mat = df_mat[cols]
-        
-        samples_dfs.append(df_mat)
+    if results:
+        df_results = pd.DataFrame(results)
+        traj_path = os.path.join(output_dir, "bdm_trajectory.csv")
+        df_results.to_csv(traj_path, index=False)
+        print(f"Saved trajectory to {traj_path}")
+        print(df_results.head())
 
-    if samples_dfs:
-        full_samples_df = pd.concat(samples_dfs, ignore_index=True)
-        samples_path = os.path.join(output_dir, "quantized_weights_samples.csv")
-        full_samples_df.to_csv(samples_path, index=False)
-        print(f"Saved quantized weight samples to: {samples_path}")
-    else:
-        print("No quantized samples collected.")
-    
-    if normalized_samples:
-        npz_path = os.path.join(output_dir, "normalized_weights_samples.npz")
-        np.savez_compressed(npz_path, **normalized_samples)
-        print(f"Saved normalized weight samples to: {npz_path}")
+    # 7. Save Samples
+    if quantized_samples:
+        samples_dfs = []
+        for key, matrix in quantized_samples.items():
+            parts = key.split('_')
+            step_val = parts[1]
+            layer_name = "_".join(parts[2:])
+            
+            df_mat = pd.DataFrame(matrix)
+            df_mat.columns = [f'col_{i}' for i in range(df_mat.shape[1])]
+            df_mat['step'] = step_val
+            df_mat['layer'] = layer_name
+            df_mat['row_idx'] = range(df_mat.shape[0])
+            
+            cols = ['step', 'layer', 'row_idx'] + [c for c in df_mat.columns if c.startswith('col_')]
+            samples_dfs.append(df_mat[cols])
+        
+        if samples_dfs:
+            full_samples_df = pd.concat(samples_dfs, ignore_index=True)
+            samples_path = os.path.join(output_dir, "quantized_weights_samples.csv")
+            full_samples_df.to_csv(samples_path, index=False)
+            print(f"Saved samples to {samples_path}")
 
     print("Done.")
 
