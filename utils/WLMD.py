@@ -281,6 +281,18 @@ def main():
     # -------------------------------------------------------------------------
     all_pts = glob.glob(os.path.join(args.checkpoint_root, "**", "*.pt"), recursive=True)
     groups = {}
+    
+    # Define task mapping for folder names
+    task_folder_map = {
+        'x_plus_y': 'x_plus_y',
+        'x_minus_y': 'x-y',
+        'x_mul_y': 'x_mul_y',
+        'x_div_y': 'x_div_y'
+    }
+    
+    # Reverse map to get canonical task name from folder name
+    folder_to_task = {v: k for k, v in task_folder_map.items()}
+    
     for pt in all_pts:
         fname = os.path.basename(pt)
 
@@ -294,17 +306,31 @@ def main():
         task_name = None
         curr = os.path.dirname(pt)
         root_abs = os.path.abspath(args.checkpoint_root)
+        
+        # Traverse up to find wd and task folders
         while True:
             if os.path.abspath(curr) == os.path.abspath(os.path.dirname(curr)):
                 break
             d = os.path.basename(curr)
+            
+            # Check for wd folder
             if d.startswith("wd_"):
                 try:
                     wd = float(d.replace("wd_", ""))
-                    task_name = os.path.basename(os.path.dirname(curr))
+                    # Task folder should be parent of wd folder
+                    task_folder = os.path.basename(os.path.dirname(curr))
+                    
+                    # Map folder name to canonical task name if possible
+                    if task_folder in folder_to_task:
+                        task_name = folder_to_task[task_folder]
+                    else:
+                        # Fallback: use folder name as task name
+                        task_name = task_folder
+                        
                 except:
                     wd = None
                 break
+            
             if os.path.abspath(curr) == root_abs:
                 break
             curr = os.path.dirname(curr)

@@ -166,13 +166,11 @@ def extract_state_dict(ckpt):
 def main():
     # 1. Configuration
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    checkpoint_dir = os.path.join(base_dir, "results", "checkpoint_transformer_2_4_128", "x-y", "wd_1.0")
     output_dir = os.path.join(base_dir, "results", "Data", "BDM")
     os.makedirs(output_dir, exist_ok=True)
     
-    print(f"Input Directory: {checkpoint_dir}")
-    print(f"Output Directory: {output_dir}")
-
+    tasks = ['x_plus_y', 'x_minus_y', 'x_mul_y', 'x_div_y']
+    
     # 2. Initialize BDM Solver
     bdm = None
     use_gzip = False
@@ -202,125 +200,138 @@ def main():
         print("pybdm not found. Using Gzip proxy.")
         use_gzip = True
 
-    # 3. Find Checkpoints
-    pattern = os.path.join(checkpoint_dir, "*.pt")
-    files = glob.glob(pattern)
-    
-    checkpoints = []
-    for fpath in files:
-        fname = os.path.basename(fpath)
-        if "seed42" in fname:
+    for task in tasks:
+        print(f"\n=== Processing Task: {task} ===")
+        
+        # Map task name to folder name if necessary
+        folder_name = task
+        if task == 'x_minus_y':
+            folder_name = 'x-y'
+            
+        checkpoint_dir = os.path.join(base_dir, "results", "checkpoint_transformer_2_4_128", folder_name, "wd_1.0")
+        
+        print(f"Input Directory: {checkpoint_dir}")
+        print(f"Output Directory: {output_dir}")
+
+        # 3. Find Checkpoints
+        pattern = os.path.join(checkpoint_dir, "*.pt")
+        files = glob.glob(pattern)
+        
+        checkpoints = []
+        for fpath in files:
+            fname = os.path.basename(fpath)
+            if "seed42" in fname:
+                try:
+                    parts = fname.replace('.pt', '').split('_')
+                    step = None
+                    for part in parts:
+                        if part.startswith('step'):
+                            step = int(part.replace('step', ''))
+                            break
+                    if step is not None:
+                        checkpoints.append((step, fpath))
+                except:
+                    pass
+        
+        checkpoints.sort(key=lambda x: x[0])
+        
+        if not checkpoints:
+            print(f"No checkpoints found for task {task}.")
+            continue
+
+        print(f"Found {len(checkpoints)} checkpoints for {task}.")
+
+        # 4. Define Sampling Steps
+        target_sample_steps = [100, 1000, 10000, 100000]
+        
+        results = []
+        quantized_samples = {}
+        
+        # 5. Process Loop
+        for step, fpath in tqdm(checkpoints, desc=f"Processing {task}"):
             try:
-                parts = fname.replace('.pt', '').split('_')
-                step = None
-                for part in parts:
-                    if part.startswith('step'):
-                        step = int(part.replace('step', ''))
-                        break
-                if step is not None:
-                    checkpoints.append((step, fpath))
-            except:
-                pass
-    
-    checkpoints.sort(key=lambda x: x[0])
-    
-    if not checkpoints:
-        print("No checkpoints found.")
-        return
-
-    print(f"Found {len(checkpoints)} checkpoints.")
-
-    # 4. Define Sampling Steps
-    target_sample_steps = [100, 1000, 10000, 100000]
-    
-    results = []
-    quantized_samples = {}
-    
-    # 5. Process Loop
-    for step, fpath in tqdm(checkpoints, desc="Processing"):
-        try:
-            model_data = torch.load(fpath, map_location="cpu")
-            state_dict = extract_state_dict(model_data)
-            
-            tensor_cnt = 0
-            mat2_cnt = 0
-            mat3_cnt = 0
-
-            if state_dict is None:
-                print(f"[Step {step}] No tensor dict found in checkpoint: {fpath}")
-                continue
-
-            tensor_cnt = sum(isinstance(v, torch.Tensor) for v in state_dict.values())
-            mat2_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==2 for v in state_dict.values())
-            mat3_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==3 for v in state_dict.values())
-            print(f"[Step {step}] tensors={tensor_cnt}, 2D={mat2_cnt}, 3D={mat3_cnt}")
-
-            total_kc = 0
-            layer_count = 0
-            
-            for name, param in state_dict.items():
-                if not isinstance(param, torch.Tensor):
-                    continue
+                model_data = torch.load(fpath, map_location="cpu")
+                state_dict = extract_state_dict(model_data)
                 
-                # Process 2D matrices
-                if param.dim() == 2:
-                    weights = param.detach().cpu().numpy()
-                    kc, quantized = process_layer(weights, bdm, use_gzip=use_gzip)
-                    total_kc += kc
-                    layer_count += 1
-                    
-                    if step in target_sample_steps:
-                        quantized_samples[f"step_{step}_{name}"] = quantized
+                tensor_cnt = 0
+                mat2_cnt = 0
+                mat3_cnt = 0
 
-                # Process 3D matrices (Heads)
-                elif param.dim() == 3:
-                    for i in range(param.shape[0]):
-                        weights = param[i].detach().cpu().numpy()
+                if state_dict is None:
+                    print(f"[Step {step}] No tensor dict found in checkpoint: {fpath}")
+                    continue
+
+                tensor_cnt = sum(isinstance(v, torch.Tensor) for v in state_dict.values())
+                mat2_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==2 for v in state_dict.values())
+                mat3_cnt = sum(isinstance(v, torch.Tensor) and v.dim()==3 for v in state_dict.values())
+                # print(f"[Step {step}] tensors={tensor_cnt}, 2D={mat2_cnt}, 3D={mat3_cnt}")
+
+                total_kc = 0
+                layer_count = 0
+                
+                for name, param in state_dict.items():
+                    if not isinstance(param, torch.Tensor):
+                        continue
+                    
+                    # Process 2D matrices
+                    if param.dim() == 2:
+                        weights = param.detach().cpu().numpy()
                         kc, quantized = process_layer(weights, bdm, use_gzip=use_gzip)
                         total_kc += kc
+                        layer_count += 1
                         
                         if step in target_sample_steps:
-                            quantized_samples[f"step_{step}_{name}_dim0_{i}"] = quantized
+                            quantized_samples[f"step_{step}_{name}"] = quantized
 
-            results.append({
-                'Step': step,
-                'Total_BDM_Value': total_kc,
-                'Layer_Count': layer_count
-            })
-            
-        except Exception as e:
-            print(f"Error step {step}: {e}")
+                    # Process 3D matrices (Heads)
+                    elif param.dim() == 3:
+                        for i in range(param.shape[0]):
+                            weights = param[i].detach().cpu().numpy()
+                            kc, quantized = process_layer(weights, bdm, use_gzip=use_gzip)
+                            total_kc += kc
+                            
+                            if step in target_sample_steps:
+                                quantized_samples[f"step_{step}_{name}_dim0_{i}"] = quantized
 
-    # 6. Save Results
-    if results:
-        df_results = pd.DataFrame(results)
-        traj_path = os.path.join(output_dir, "bdm_trajectory.csv")
-        df_results.to_csv(traj_path, index=False)
-        print(f"Saved trajectory to {traj_path}")
-        print(df_results.head())
+                results.append({
+                    'Step': step,
+                    'Total_BDM_Value': total_kc,
+                    'Layer_Count': layer_count
+                })
+                
+            except Exception as e:
+                print(f"Error step {step}: {e}")
 
-    # 7. Save Samples
-    if quantized_samples:
-        samples_dfs = []
-        for key, matrix in quantized_samples.items():
-            parts = key.split('_')
-            step_val = parts[1]
-            layer_name = "_".join(parts[2:])
+        # 6. Save Results
+        if results:
+            df_results = pd.DataFrame(results)
+            traj_path = os.path.join(output_dir, f"bdm_trajectory_{task}.csv")
+            df_results.to_csv(traj_path, index=False)
+            print(f"Saved trajectory to {traj_path}")
+            print(df_results.head())
+
+        # 7. Save Samples
+        if quantized_samples:
+            samples_dfs = []
+            for key, matrix in quantized_samples.items():
+                parts = key.split('_')
+                step_val = parts[1]
+                layer_name = "_".join(parts[2:])
+                
+                df_mat = pd.DataFrame(matrix)
+                df_mat.columns = [f'col_{i}' for i in range(df_mat.shape[1])]
+                df_mat['step'] = step_val
+                df_mat['layer'] = layer_name
+                df_mat['row_idx'] = range(df_mat.shape[0])
+                
+                cols = ['step', 'layer', 'row_idx'] + [c for c in df_mat.columns if c.startswith('col_')]
+                samples_dfs.append(df_mat[cols])
             
-            df_mat = pd.DataFrame(matrix)
-            df_mat.columns = [f'col_{i}' for i in range(df_mat.shape[1])]
-            df_mat['step'] = step_val
-            df_mat['layer'] = layer_name
-            df_mat['row_idx'] = range(df_mat.shape[0])
-            
-            cols = ['step', 'layer', 'row_idx'] + [c for c in df_mat.columns if c.startswith('col_')]
-            samples_dfs.append(df_mat[cols])
-        
-        if samples_dfs:
-            full_samples_df = pd.concat(samples_dfs, ignore_index=True)
-            samples_path = os.path.join(output_dir, "quantized_weights_samples.csv")
-            full_samples_df.to_csv(samples_path, index=False)
-            print(f"Saved samples to {samples_path}")
+            if samples_dfs:
+                full_samples_df = pd.concat(samples_dfs, ignore_index=True)
+                samples_path = os.path.join(output_dir, f"quantized_weights_samples_{task}.csv")
+                full_samples_df.to_csv(samples_path, index=False)
+                print(f"Saved samples to {samples_path}")
 
     print("Done.")
 
